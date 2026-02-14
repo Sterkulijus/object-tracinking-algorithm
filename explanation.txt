@@ -1,0 +1,386 @@
+UA-DETRAC + YOLOv8 + ByteTrack + Line-Cross Counting + Dwell Time
+=============================================================
+
+This document explains how the *original* script you provided works end-to-end:
+- Optionally downloads the UA-DETRAC dataset via kagglehub
+- Automatically finds a folder containing many frame images (.jpg/.png)
+- Runs YOLOv8 detections restricted to COCO person + vehicle classes
+- Uses Ultralytics tracking (ByteTrack config) to keep stable IDs across frames
+- Draws annotated bounding boxes + a counting line onto each frame
+- Produces an annotated MP4 video
+- Computes:
+  - Enter/Exit counts per group (person vs vehicle) based on crossing direction
+  - Average dwell time (seconds) for completed tracks
+
+-------------------------------------------------------------
+1) High-level flow
+-------------------------------------------------------------
+
+When you run the script, it does:
+
+1. Parse CLI arguments (model, thresholds, tracker cfg, dataset path, line params, etc.)
+2. (Optional) Download UA-DETRAC using kagglehub if --download is passed
+3. Locate a “sequence directory” containing many image frames
+4. Read the first frame to determine resolution (and optional resize)
+5. Define a counting line (default: horizontal line at 60% of image height)
+6. Initialize YOLO model, video writer, and tracking/counting state
+7. For each frame:
+   - Read image
+   - Resize (optional)
+   - Run YOLOv8 + tracking (model.track with persist=True)
+   - For each tracked detection:
+       - Update per-track state
+       - Detect line-crossing direction to count enter/exit
+       - Draw bounding box + label
+   - Finalize tracks that have disappeared long enough (dwell time)
+   - Draw counting line + overlay statistics text
+   - Write annotated frame to output video
+8. At end:
+   - Finalize remaining tracks (treat as ended at last frame)
+   - Save summary.json + dwell_times.json
+   - Print output paths
+
+-------------------------------------------------------------
+2) Installation requirements (what the script uses)
+-------------------------------------------------------------
+
+- ultralytics: provides YOLOv8 model loading and tracking API (model.track)
+- opencv-python (cv2): image I/O, drawing, video writing
+- numpy: geometry calculations, arrays
+- tqdm: progress bar
+- kagglehub (optional): dataset download helper
+
+-------------------------------------------------------------
+3) Optional dataset download: maybe_download()
+-------------------------------------------------------------
+
+Function: maybe_download(download: bool) -> Optional[str]
+
+- If --download is NOT used, it returns None.
+- If --download is used:
+  - Imports kagglehub
+  - Calls kagglehub.dataset_download("bratjay/ua-detrac-orig")
+  - Prints the resolved local download path
+  - Returns that path
+
+The main program then uses:
+  dataset_path = dl_path or args.dataset_path
+
+So either:
+- download path (if you used --download), or
+- user-provided --dataset_path
+
+-------------------------------------------------------------
+4) Finding a sequence folder of frames
+-------------------------------------------------------------
+
+UA-DETRAC is often nested (root / some folders / sequence / images...), so the
+script tries to locate a directory that *looks like* a frame sequence.
+
+Key pieces:
+
+A) IMAGE_EXTS and is_image_file()
+- IMAGE_EXTS contains {".jpg", ".jpeg", ".png"}.
+- is_image_file(p) checks if the file extension matches.
+
+B) find_sequence_dirs(root, min_frames=200)
+- Recursively scans all subfolders under root using root.rglob("*")
+- For each folder, it counts image files (up to min_frames)
+- If a folder contains >= min_frames images, it is considered a candidate
+
+Candidate ranking:
+- A small scoring function prefers folders whose name contains:
+  - "img" or "image" (higher weight)
+  - "seq" or "mvi" (small weight)
+- Candidates are sorted by score descending.
+
+C) pick_sequence_dir(dataset_path, sequence_hint, min_frames)
+This chooses the best folder to use:
+
+1) First, checks if dataset_path itself already contains >= min_frames images.
+   If yes, it uses dataset_path directly.
+
+2) If sequence_hint is provided:
+   - Finds folders whose path contains that substring
+   - Keeps only those with >= min_frames images
+   - Picks the one with the most images
+
+3) Otherwise:
+   - Calls find_sequence_dirs() and picks the top-ranked folder
+
+D) list_frames(seq_dir)
+- Lists image files directly inside seq_dir (not recursive)
+- Sorts by filename (simple lexicographic sort)
+- Returns the ordered frame list
+
+Note: For some datasets, lexicographic sorting is fine because filenames are
+zero-padded (e.g., 000001.jpg, 000002.jpg). If not padded, “10.jpg” would come
+before “2.jpg”; the script says “natural sort” but actually uses name sort.
+
+-------------------------------------------------------------
+5) Counting line geometry
+-------------------------------------------------------------
+
+The script defines a line segment from A(x1,y1) to B(x2,y2).
+
+Default:
+- If the user does not provide --line_x1 --line_y1 --line_x2 --line_y2:
+  - It uses a horizontal line across the frame:
+    y = round(line_y_frac * height)
+    A = (0, y)
+    B = (width - 1, y)
+
+Line-side calculation:
+- side_of_line(a, b, p) computes a signed cross product.
+- The sign indicates which side of the line the point P lies on:
+  - positive => one side
+  - negative => the other side
+  - near 0 => on the line
+
+This side value is used to detect a “crossing”:
+- If previous side is positive and current side is negative, or vice versa,
+  the object has crossed the line.
+
+-------------------------------------------------------------
+6) Detection + tracking (YOLOv8 + ByteTrack)
+-------------------------------------------------------------
+
+The core call is:
+
+results = model.track(
+    source=frame,
+    persist=True,
+    tracker=tracker_cfg,
+    conf=conf,
+    iou=iou,
+    classes=class_ids,
+    verbose=False,
+)
+
+Important parameters:
+- persist=True:
+  - Keeps internal tracker state across frames
+  - This is what allows track IDs to remain consistent frame-to-frame
+- tracker=tracker_cfg:
+  - Typically "bytetrack.yaml" (ByteTrack) or "botsort.yaml"
+  - Controls the tracking algorithm and parameters
+- classes=class_ids:
+  - Restricts YOLO detections to specific COCO classes
+
+Classes used:
+- 0: person
+- 2: car
+- 3: motorcycle
+- 5: bus
+- 7: truck
+
+The script groups them into two “counting categories”:
+- group = "person" for class 0
+- group = "vehicle" for classes 2,3,5,7
+
+That’s why the counters are only:
+- enter_counts["person"], enter_counts["vehicle"]
+- exit_counts["person"], exit_counts["vehicle"]
+
+-------------------------------------------------------------
+7) Track state (how IDs are remembered)
+-------------------------------------------------------------
+
+The script stores per-track info in:
+
+state: Dict[int, Dict]
+
+Each active track ID has an entry like:
+
+state[tid] = {
+  "cls": int,              # most recent class for this track
+  "group": str,            # "person" or "vehicle"
+  "first_frame": int,      # first frame index where seen
+  "last_frame": int,       # most recent frame index where detected
+  "last_seen": int,        # most recent frame index where detected (same as last_frame)
+  "prev_side": float,      # previous side_of_line value
+  "counted_enter": bool,   # whether enter count already credited for this track
+  "counted_exit": bool,    # whether exit count already credited for this track
+  "last_center": (cx, cy)  # last center point for “movement” check
+}
+
+Why store both last_frame and last_seen?
+- In this script they are updated together, but last_seen is used specifically
+  to decide when a track has been “lost” long enough to finalize dwell time.
+
+-------------------------------------------------------------
+8) Enter/Exit logic (directional line crossing)
+-------------------------------------------------------------
+
+Per detection, the script computes the box center:
+- cx = (x1 + x2)/2
+- cy = (y1 + y2)/2
+- p = (cx, cy)
+
+Then it computes:
+- cur_side = side_of_line(A, B, p)
+
+If a track already exists, it compares:
+- prev_side (stored) vs cur_side (current)
+
+Crossing detection:
+- crossed = (prev_side > 0) != (cur_side > 0)
+  (i.e., sign changed)
+
+It also checks “moved > 5 pixels” to avoid false flips:
+- moved = |cx - prev_cx| + |cy - prev_cy|
+- if moved <= 5, it ignores the crossing event
+
+Direction definition:
+- enter_rule is either:
+  - "neg_to_pos": ENTER occurs when side changes from negative to positive
+  - "pos_to_neg": ENTER occurs when side changes from positive to negative
+- EXIT is simply the opposite direction of ENTER
+
+One-time counting per track:
+- Each track can increment ENTER at most once (counted_enter flag)
+- Each track can increment EXIT at most once (counted_exit flag)
+
+This prevents double-counting if an object oscillates near the line.
+
+-------------------------------------------------------------
+9) Dwell time (how long an object stays “in scene”)
+-------------------------------------------------------------
+
+Dwell time is computed per track in seconds:
+
+duration_frames = last_frame - first_frame + 1
+duration_seconds = duration_frames / fps
+
+When is a track considered “completed”?
+- If it disappears and stays missing for longer than max_lost_seconds.
+
+Implementation:
+- max_lost_frames = round(max_lost_seconds * fps)
+
+finalize_track(tid, cur_frame_idx):
+- Checks if (cur_frame_idx - last_seen) > max_lost_frames
+- If yes:
+  - Computes duration
+  - Appends to dwell_times[group]
+  - Removes the track from state
+
+At the very end:
+- The script finalizes all remaining tracks too (even if they never “left”),
+  treating the last frame as their endpoint.
+
+Average dwell time shown in overlay:
+- avg(dwell_times["person"]) and avg(dwell_times["vehicle"])
+- Only includes finalized (completed) tracks so far during processing
+  (and after end, includes all)
+
+-------------------------------------------------------------
+10) Drawing/annotation (OpenCV overlay)
+-------------------------------------------------------------
+
+For each frame:
+- Draw bounding boxes per detection:
+  - person group is green
+  - vehicle group is blue
+  - other group is yellow (mostly unused due to class filter)
+
+- Draw a filled label background rectangle + text:
+  "class_name #track_id conf"
+
+- Draw the counting line in red
+
+- Draw statistics overlay text:
+  ENTER counts
+  EXIT counts
+  AVG DWELL times
+  Active tracks count
+
+This annotated frame is then written to the output video.
+
+-------------------------------------------------------------
+11) Output files
+-------------------------------------------------------------
+
+In out_dir (default "outputs") the script writes:
+
+1) annotated.mp4
+- The annotated video with boxes, IDs, and stats.
+
+2) summary.json
+Contains:
+- dataset path and selected sequence directory
+- output video path
+- fps used
+- counting line coordinates
+- enter/exit counts per group
+- average dwell seconds per group
+- number of completed tracks per group
+
+3) dwell_times.json
+Contains:
+- lists of dwell durations (seconds) per group:
+  - dwell_times["person"] = [ ... ]
+  - dwell_times["vehicle"] = [ ... ]
+
+-------------------------------------------------------------
+12) CLI arguments (what they do)
+-------------------------------------------------------------
+
+Key arguments:
+
+--download
+  Downloads dataset via kagglehub and uses it automatically.
+
+--dataset_path
+  Use an already downloaded dataset path.
+
+--sequence_hint
+  A substring to help locate a specific sequence folder.
+
+--min_frames
+  Minimum number of frames needed for a folder to be considered a valid sequence.
+
+--model
+  YOLOv8 model name or path, e.g., yolov8n.pt, yolov8s.pt, custom.pt.
+
+--conf / --iou
+  Detection confidence and NMS IoU thresholds passed into model.track.
+
+--tracker
+  Tracking configuration file, e.g., bytetrack.yaml or botsort.yaml.
+
+--fps
+  Used for:
+  - output video FPS
+  - dwell time conversion frames -> seconds
+
+--max_lost_seconds
+  How long a track can be missing before it’s finalized (ends dwell time).
+
+Counting line arguments:
+--line_x1 --line_y1 --line_x2 --line_y2
+  Explicit line endpoints (override default).
+
+--line_y_frac
+  If explicit endpoints are not set, use horizontal line at this fraction of height.
+
+--enter_rule
+  Which side-change direction is considered ENTER.
+
+--resize_width
+  Resizes frames to this width (aspect preserved) to speed up processing.
+
+-------------------------------------------------------------
+13) Practical notes / limitations
+-------------------------------------------------------------
+
+- UA-DETRAC is a vehicle dataset; “person” detections may be rare or absent.
+- Tracking IDs come from the tracker; they are not globally unique across runs.
+- Simple filename sorting may not be “natural” if filenames aren’t zero-padded.
+- If FPS is wrong, dwell times will be scaled incorrectly (because dwell uses fps).
+- Line-crossing depends on center point; large boxes that straddle the line may
+  sometimes “cross” earlier/later than visually expected.
+
+-------------------------------------------------------------
+End of document
+-------------------------------------------------------------
