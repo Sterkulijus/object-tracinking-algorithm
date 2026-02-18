@@ -17,7 +17,14 @@ pip install -r requirements.txt
 
 ## Usage
 
-python -m src.main --dataset_path <path> --model yolov8n.pt
+### Run (auto download + process first found sequence):
+  python ua_detrac_yolo_track_count.py --download
+
+### Run (use existing downloaded path):
+  python ua_detrac_yolo_track_count.py --dataset_path "YOUR_PATH_FROM_kagglehub" --sequence_auto
+  
+### Run (choose a specific sequence folder name substring):
+  python ua_detrac_yolo_track_count.py --dataset_path "..." --sequence_hint "MVI_20011"
 
 ## Outputs
 
