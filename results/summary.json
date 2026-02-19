@@ -1,0 +1,29 @@
+{
+  "dataset_path": "C:\\Users\\oskar\\.cache\\kagglehub\\datasets\\bratjay\\ua-detrac-orig\\versions\\2",
+  "sequence_dir": "C:\\Users\\oskar\\.cache\\kagglehub\\datasets\\bratjay\\ua-detrac-orig\\versions\\2\\DETRAC-Images\\DETRAC-Images\\MVI_20011",
+  "output_video": "outputs\\annotated.mp4",
+  "fps_used": 25.0,
+  "counting_line": {
+    "x1": 0.0,
+    "y1": 324.0,
+    "x2": 959.0,
+    "y2": 324.0
+  },
+  "enter_rule": "neg_to_pos",
+  "enter_counts": {
+    "person": 1,
+    "vehicle": 24
+  },
+  "exit_counts": {
+    "person": 2,
+    "vehicle": 0
+  },
+  "avg_dwell_seconds": {
+    "person": 4.0906666666666665,
+    "vehicle": 3.993076923076924
+  },
+  "num_completed_tracks": {
+    "person": 30,
+    "vehicle": 104
+  }
+}
